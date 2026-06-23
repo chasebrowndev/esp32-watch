@@ -1,0 +1,7 @@
+.pio/
+.vscode/
+.cache/
+.claude/
+*.swp
+*.swo
+.DS_Store

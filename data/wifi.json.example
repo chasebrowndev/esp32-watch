@@ -1,0 +1,5 @@
+{
+  "comment": "Copy to wifi.json and fill in. Seeds NVS on first boot if no creds stored. The on-watch provisioning screen can also set these.",
+  "ssid": "YOUR_SSID",
+  "password": "YOUR_PASSWORD"
+}
