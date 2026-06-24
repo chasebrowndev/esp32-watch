@@ -282,17 +282,26 @@ bool start(const char* ssid, const char* pass) {
   s_hitCount = 0;
   for (uint8_t i = 0; i < LOG_MAX; ++i) s_hits[i] = Hit{};
 
+  // Force the radio off first so a prior STA mode (scanner) is fully torn
+  // down before we re-enter AP — arduino-esp32 v3 sometimes leaves the AP
+  // netif disabled (no beacons) if we flip STA→AP directly.
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_OFF);
+  delay(50);
   WiFi.mode(WIFI_AP);
-  // Random locally-administered MAC per session. See captive::start for
-  // the rationale.
+  // Random locally-administered MAC per session. set_mac must run while the
+  // interface is in AP mode but not yet started; do it before softAP().
   uint8_t mac[6];
   for (int i = 0; i < 6; ++i) mac[i] = (uint8_t)esp_random();
   mac[0] = (mac[0] & 0xFC) | 0x02;
   esp_wifi_set_mac(WIFI_IF_AP, mac);
+  if (!WiFi.softAP(ssid ? ssid : "watch-files", pass)) return false;
+  // softAPConfig must follow softAP on arduino-esp32 v3 — calling it first
+  // applies IP config to a netif that isn't fully up yet and beacons never
+  // start.
   WiFi.softAPConfig(IPAddress(192, 168, 4, 1),
                     IPAddress(192, 168, 4, 1),
                     IPAddress(255, 255, 255, 0));
-  if (!WiFi.softAP(ssid ? ssid : "watch-files", pass)) return false;
 
   s_http = new AsyncWebServer(80);
   s_http->on("/", HTTP_GET, [](AsyncWebServerRequest* req) {

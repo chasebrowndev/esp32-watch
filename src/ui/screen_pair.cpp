@@ -1,8 +1,9 @@
 // BLE pair manager: shows connection state and a bonded peer SELECTOR.
-// Tapping a row makes that peer the only one the watch will advertise to /
-// accept (via NimBLE whitelist), so the user can pick "talk to TV" vs
-// "talk to phone". Per-row edit (rename) + trash, plus Forget All + Pair New
-// (clear selection + advertise to anyone) at the right. Rebuilt on open.
+// Tapping a row marks that bond as the target — the watch starts DIRECTED
+// advertising at that host's bonded address, asking it to reconnect using
+// the stored bond (no re-pair). At most one bond is selected at a time.
+// Per-row edit (rename) + trash, plus Forget All + Pair New (undirected
+// discoverable advertising for a brand-new host) at the right.
 #include "screen_pair.h"
 #include "ui_theme.h"
 #include "config.h"
@@ -26,8 +27,15 @@ static void closeRename();
 
 static void cb_select(lv_event_t* e) {
   uint8_t i = (uint8_t)(uintptr_t)lv_event_get_user_data(e);
-  if (ble_hid::isSelected(i)) ble_hid::deselectBond(i);
-  else                        ble_hid::selectBond(i);
+  if (ble_hid::isSelected(i)) {
+    // Tapping the currently-selected row again retries the directed adv
+    // (handy after a timeout) rather than deselecting — feels closer to the
+    // mental model of "tap to connect."
+    if (ble_hid::reconnectFailed()) ble_hid::retrySelection();
+    else                            ble_hid::deselectBond(i);
+  } else {
+    ble_hid::selectBond(i);
+  }
   rebuild();
 }
 static void cb_forget(lv_event_t* e) {
@@ -58,12 +66,10 @@ static void cb_exitPairNew(lv_event_t*) {
   rebuild();
 }
 static void cb_newDevice(lv_event_t*) {
-  // Open the door for a fresh pairing: clear selection so a new peer can
-  // discover us (whitelist would otherwise block unknown devices), and
-  // re-advertise.
+  // PAIR NEW: enter undirected, discoverable advertising. Clears any active
+  // host selection so the new peer doesn't lose the race to the directed-adv
+  // target. Existing bonds are not touched.
   ble_hid::clearSelection();
-  ble_hid::stopAdvertising();
-  ble_hid::startAdvertising();
   rebuild();
 }
 
@@ -203,6 +209,20 @@ void create(lv_obj_t* parent) {
 
 void tick() {
   if (!s_status) return;
+#if FEAT_BLE_HID
+  // Rebuild the list whenever the bond count OR connection state changes —
+  // catches new pairings (PAIR NEW completing) and reconnect transitions
+  // without forcing the user to leave + re-enter the screen.
+  static uint8_t s_lastBonds = 0xFF;
+  static bool    s_lastConn  = false;
+  uint8_t curBonds = ble_hid::numBonds();
+  bool    curConn  = ble_hid::connected();
+  if (curBonds != s_lastBonds || curConn != s_lastConn) {
+    s_lastBonds = curBonds;
+    s_lastConn  = curConn;
+    rebuild();
+  }
+#endif
   static uint32_t last = 0;
   uint32_t now = lv_tick_get();
   if (now - last < 1000) return;
@@ -211,26 +231,23 @@ void tick() {
   if (s_exitBtn) {
     bool inMode = ble_hid::pairNewMode();
     bool hidden = lv_obj_has_flag(s_exitBtn, LV_OBJ_FLAG_HIDDEN);
-    if (inMode && hidden)       lv_obj_clear_flag(s_exitBtn, LV_OBJ_FLAG_HIDDEN);
+    if (inMode && hidden)        lv_obj_clear_flag(s_exitBtn, LV_OBJ_FLAG_HIDDEN);
     else if (!inMode && !hidden) lv_obj_add_flag(s_exitBtn, LV_OBJ_FLAG_HIDDEN);
   }
-  bool pairNew = ble_hid::pairNewMode();
-  if (ble_hid::connected() && (pairNew || !ble_hid::peerBlacklisted())) {
-    static char buf[64];
-    snprintf(buf, sizeof(buf), "paired: %s", ble_hid::peerAddr());
+  static char buf[80];
+  if (ble_hid::connected()) {
+    snprintf(buf, sizeof(buf), "connected: %s", ble_hid::peerAddr());
     lv_label_set_text(s_status, buf);
-  } else if (ble_hid::peerBlacklisted()) {
-    lv_label_set_text(s_status, "kicking blacklisted peer...");
+  } else if (ble_hid::pairNewMode()) {
+    lv_label_set_text(s_status, "PAIR NEW: discoverable to any host");
+  } else if (ble_hid::reconnecting()) {
+    lv_label_set_text(s_status, "reconnecting to selected host...");
+  } else if (ble_hid::reconnectFailed()) {
+    lv_label_set_text(s_status, "reconnect timed out — tap host to retry");
   } else {
-    uint8_t n = ble_hid::numBonds(), allowed = 0;
-    for (uint8_t i = 0; i < n; ++i) if (ble_hid::isSelected(i)) allowed++;
-    static char buf[64];
-    if (n == 0)              lv_label_set_text(s_status, "advertising (no bonds)");
-    else if (allowed == 0)   lv_label_set_text(s_status, "pair-new mode: all bonds blocked");
-    else {
-      snprintf(buf, sizeof(buf), "advertising (%u/%u allowed)", allowed, n);
-      lv_label_set_text(s_status, buf);
-    }
+    uint8_t n = ble_hid::numBonds();
+    if (n == 0) lv_label_set_text(s_status, "idle — tap PAIR NEW to add a host");
+    else        lv_label_set_text(s_status, "idle — tap a host to connect");
   }
 #endif
 }

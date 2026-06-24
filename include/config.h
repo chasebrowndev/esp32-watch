@@ -18,12 +18,17 @@
 #define FEAT_USB_MSC   1   // USB-C mass storage (present SD card to host)
 
 // ---- Power management ----
-#define IDLE_DIM_MS    8000    // dim backlight after this idle time
-#define IDLE_SLEEP_MS  20000   // screen off / light-sleep after this idle time
+#define IDLE_DIM_MS    5000    // dim backlight after this idle time
+#define IDLE_SLEEP_MS  12000   // screen off / light-sleep after this idle time
 // Deep sleep removed: PIN_TP_INT doesn't fire on this hardware, so an
 // ext0 wake would never trigger and the board would brick until reset.
-#define BL_BRIGHT      255
-#define BL_DIM         40
+//
+// BL_BRIGHT is the factory default only; per-user value is persisted in NVS
+// ("power"/"bright") and survives reflash. 180 is plainly visible indoors
+// and saves ~30% backlight current vs 255 — the backlight is the dominant
+// idle consumer on this panel.
+#define BL_BRIGHT      180
+#define BL_DIM         25
 
 // ---- Battery (LiPo via on-board divider on PIN_BAT_ADC) ----
 // Most ESP32-S3 dev boards use a 2:1 resistor divider so 4.2V battery reads

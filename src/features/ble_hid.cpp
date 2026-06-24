@@ -1,11 +1,11 @@
 #include "ble_hid.h"
+#include "ble_ota.h"
 #include "ble_radio.h"
 #include <Arduino.h>
 #include <NimBLEDevice.h>
 #include <NimBLEHIDDevice.h>
 #include <Preferences.h>
 #include <lvgl.h>
-#include <vector>
 
 namespace {
   NimBLEServer*       s_server  = nullptr;
@@ -14,11 +14,33 @@ namespace {
   NimBLECharacteristic* s_kbInput = nullptr;
   NimBLECharacteristic* s_mouseInput = nullptr;
   volatile bool       s_connected = false;
+  volatile uint16_t   s_connHandle = 0xFFFF;
   bool                s_init    = false;
   bool                s_suspended = false;
 
-  // HID report map: report ID 1 = consumer control (1 byte, 8 bits),
-  //                 report ID 2 = boot keyboard (8 mods + 1 reserved + 6 keys).
+  // ------- Reconnect state machine -------
+  // The watch is a peripheral. "Connect to host" = undirected connectable
+  // advertising with a connection-filter whitelist: the watch is visible to
+  // every scanner (so Android/iOS surface it normally and HID auto-reconnect
+  // logic kicks in), but only the bonded peer in the whitelist can actually
+  // open a link. PAIR NEW = undirected, no whitelist, any peer can connect.
+  //
+  // Directed advertising (ADV_DIRECT_IND) was tried first but most phones'
+  // general scanners skip it, so the watch looked invisible from the user's
+  // POV — even when the directed adv was on-air. Undirected + whitelist is
+  // the standard pattern for HID-over-GATT reconnect.
+  enum AdvMode : uint8_t { ADV_IDLE, ADV_WHITELIST, ADV_OPEN };
+  AdvMode       s_currentAdv = ADV_IDLE;
+  bool          s_pairNew = false;            // PAIR NEW: open, accept any peer
+  bool          s_hasSelection = false;       // s_selectedAddr is valid
+  NimBLEAddress s_selectedAddr;               // whitelisted peer
+  // Status-only deadline so the UI can say "still trying" vs "no response
+  // yet, maybe pick a different host." Adv itself runs continuously while a
+  // selection is active — the deadline does NOT stop advertising.
+  uint32_t      s_selectStartedMs = 0;
+  const uint32_t SELECT_TIMEOUT_MS = 45000;
+
+  // ------- HID report map (unchanged) -------
   const uint8_t REPORT_MAP[] = {
     0x05, 0x0C,        // Usage Page (Consumer)
     0x09, 0x01,        // Usage (Consumer Control)
@@ -44,16 +66,16 @@ namespace {
     0xA1, 0x01,        // Collection (Application)
     0x85, 0x02,        //   Report ID (2)
     0x05, 0x07,        //   Usage Page (Key Codes)
-    0x19, 0xE0,        //   Usage Min (Left Ctrl)
-    0x29, 0xE7,        //   Usage Max (Right GUI)
+    0x19, 0xE0,
+    0x29, 0xE7,
     0x15, 0x00,
     0x25, 0x01,
     0x75, 0x01,
     0x95, 0x08,
-    0x81, 0x02,        //   modifiers
+    0x81, 0x02,
     0x95, 0x01,
     0x75, 0x08,
-    0x81, 0x01,        //   reserved
+    0x81, 0x01,
     0x95, 0x06,
     0x75, 0x08,
     0x15, 0x00,
@@ -61,30 +83,29 @@ namespace {
     0x05, 0x07,
     0x19, 0x00,
     0x29, 0x65,
-    0x81, 0x00,        //   6 keycodes
+    0x81, 0x00,
     0xC0,
 
-    // Report ID 3 = relative mouse (3 buttons + dx + dy + wheel).
     0x05, 0x01,        // Usage Page (Generic Desktop)
     0x09, 0x02,        // Usage (Mouse)
-    0xA1, 0x01,        // Collection (Application)
+    0xA1, 0x01,
     0x85, 0x03,        //   Report ID (3)
-    0x09, 0x01,        //   Usage (Pointer)
-    0xA1, 0x00,        //   Collection (Physical)
-    0x05, 0x09,        //     Usage Page (Buttons)
+    0x09, 0x01,
+    0xA1, 0x00,
+    0x05, 0x09,
     0x19, 0x01, 0x29, 0x03,
     0x15, 0x00, 0x25, 0x01,
     0x95, 0x03, 0x75, 0x01,
-    0x81, 0x02,        //     3 button bits
+    0x81, 0x02,
     0x95, 0x01, 0x75, 0x05,
-    0x81, 0x03,        //     5 bits padding
+    0x81, 0x03,
     0x05, 0x01,
-    0x09, 0x30,        //     X
-    0x09, 0x31,        //     Y
-    0x09, 0x38,        //     Wheel
+    0x09, 0x30,
+    0x09, 0x31,
+    0x09, 0x38,
     0x15, 0x81, 0x25, 0x7F,
     0x75, 0x08, 0x95, 0x03,
-    0x81, 0x06,        //     X,Y,Wheel relative
+    0x81, 0x06,
     0xC0,
     0xC0
   };
@@ -94,9 +115,6 @@ namespace {
     B_VOLDN = 1 << 4, B_MUTE = 1 << 5, B_HOME = 1 << 6, B_BACK = 1 << 7,
   };
 
-  // Dumps the current bond list to serial. Called on connect/disconnect and
-  // after pair-related operations so we can tell from a serial capture
-  // whether bonds are actually persisting vs. silently being evicted.
   static void dumpBonds(const char* tag) {
     int n = NimBLEDevice::getNumBonds();
     Serial.printf("[hid] bonds@%s count=%d cap=%d\n",
@@ -107,30 +125,34 @@ namespace {
     }
   }
 
+  // GAP callbacks run in the NimBLE host task. The rule here is: NEVER call
+  // startAdvertising / stopAdvertising from inside one — set flags and let
+  // tick() (main task) converge the adv state. Doing the work inline races
+  // with the host's own teardown and was the source of "advertising never
+  // restarts after disconnect" stalls.
   class ServerCB : public NimBLEServerCallbacks {
-    void onConnect(NimBLEServer*) override    {
-      s_connected = true;
-      dumpBonds("connect");
-    }
-    void onDisconnect(NimBLEServer*) override {
-      s_connected = false;
-      // Only re-advertise if HID still owns the radio. If spam or scan
-      // took over, restarting advertising here would clobber their state
-      // and put the device in the "non-connectable spoof leftover"
-      // failure mode that motivated this whole refactor.
-      if (!s_suspended && ble_radio::current() != ble_radio::MODE_SPAM
-                       && ble_radio::current() != ble_radio::MODE_SCAN) {
-        ble_hid::startAdvertising();
+    void onConnect(NimBLEServer*, ble_gap_conn_desc* desc) override {
+      // Single active connection: if we already have a peer, drop the new
+      // one. By the time this fires for the 2nd peer the 1st is established,
+      // so we kick the newcomer rather than disrupt the existing link.
+      if (s_connected && desc->conn_handle != s_connHandle) {
+        ble_gap_terminate(desc->conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        return;
       }
+      s_connected  = true;
+      s_connHandle = desc->conn_handle;
+      s_selectStartedMs = 0;
+      s_currentAdv = ADV_IDLE;   // NimBLE auto-stops adv on connect
+    }
+    void onDisconnect(NimBLEServer*, ble_gap_conn_desc*) override {
+      s_connected = false;
+      s_connHandle = 0xFFFF;
+      // Don't touch the radio here. tick() will see s_connected=false and
+      // converge advertising back to whatever state matches the selection.
     }
   };
   ServerCB s_cb;
 
-  // Single-slot pending release. A key-down is sent immediately and the
-  // matching key-up is dispatched ~20 ms later via an lv_timer so the LVGL
-  // event loop (and therefore the touch indev) isn't blocked by delay().
-  // If a new key arrives while one is still pending, the previous release is
-  // flushed immediately so the host never sees two simultaneous presses.
   enum class Pending : uint8_t { None, Consumer, Keyboard, Mouse };
   volatile Pending s_pending = Pending::None;
   lv_timer_t*      s_release = nullptr;
@@ -170,7 +192,6 @@ namespace {
     scheduleRelease(Pending::Consumer);
   }
 
-  // Boot-keyboard input: 8 bytes [mods, reserved, keycode0..5].
   void sendKey(uint8_t keycode) {
     if (!s_connected || !s_kbInput) return;
     if (s_release) { lv_timer_delete(s_release); s_release = nullptr; flushRelease(); }
@@ -184,57 +205,151 @@ namespace ble_hid {
 
 namespace { char s_name[24] = "smartwatch"; }
 
-void applySelection();   // fwd; defined below in this namespace
-namespace { bool inBlacklist(const char* addr); } // fwd for tick()
-
-// Re-install the HID advertisement payload + connectable mode + intervals.
-// This is the single source of truth for "what HID advertising looks like."
-// Called from begin(), resume(), applySelection(), and via the radio
-// arbiter when another subsystem releases the radio. Without this, the
-// shared NimBLEAdvertising singleton retains whatever spam/beacon stuffed
-// into it and HID re-advertises as a non-connectable spoof packet.
-static void reinstallAdvData() {
+// Install the connectable HID advertisement payload + intervals. Caller
+// drives conn_mode (DIR vs UND) and start params; this only fills payload.
+static void installHidAdvData() {
   if (!s_init || !s_hid) return;
   NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
   if (!adv) return;
 
   NimBLEAdvertisementData d;
-  d.setFlags(0x06);                       // LE General Discoverable + BR/EDR not supported
+  d.setFlags(0x06);
   d.setName(s_name);
-  d.setAppearance(0x03C1);                // HID Keyboard
+  d.setAppearance(0x03C1);
   d.setCompleteServices(s_hid->hidService()->getUUID());
   adv->setAdvertisementData(d);
 
-  NimBLEAdvertisementData sr;             // scan response carries the name too
+  NimBLEAdvertisementData sr;
   sr.setName(s_name);
   adv->setScanResponseData(sr);
 
   adv->setAppearance(0x03C1);
   adv->setName(s_name);
-  adv->setAdvertisementType(BLE_GAP_CONN_MODE_UND);   // connectable, undirected
-  adv->setMinInterval(0x30);              // 30 ms
-  adv->setMaxInterval(0x60);              // 60 ms
+  adv->setMinInterval(0x30);
+  adv->setMaxInterval(0x60);
+  adv->setScanFilter(false, false);
 }
 
-// Restore callback used by ble_radio when the radio is handed back to HID.
+// ---------- bond name + selection persistence ----------
+namespace {
+  // NVS key from address: strip colons -> 12 hex chars (fits 15-char limit).
+  void addrKey(const char* addr, char out[16]) {
+    int j = 0;
+    for (int k = 0; addr[k] && j < 15; ++k) if (addr[k] != ':') out[j++] = addr[k];
+    out[j] = 0;
+  }
+
+  // Selected-host persistence: namespace "blesel", key "sel" = full MAC
+  // string. Survives reboot so battery swaps don't lose the active host.
+  void persistSelected() {
+    Preferences p;
+    if (!p.begin("blesel", false)) return;
+    if (s_hasSelection) p.putString("sel", s_selectedAddr.toString().c_str());
+    else                p.remove("sel");
+    p.end();
+  }
+  void loadSelected() {
+    Preferences p;
+    if (!p.begin("blesel", true)) return;
+    String v = p.getString("sel", "");
+    p.end();
+    if (v.length() == 0) { s_hasSelection = false; return; }
+    // NimBLEAddress(string) accepts xx:xx:xx:xx:xx:xx.
+    NimBLEAddress a(std::string(v.c_str()));
+    // Only honor the saved selection if the bond still exists.
+    int n = NimBLEDevice::getNumBonds();
+    for (int i = 0; i < n; ++i) {
+      if (NimBLEDevice::getBondedAddress(i) == a) {
+        s_selectedAddr = a;
+        s_hasSelection = true;
+        return;
+      }
+    }
+    s_hasSelection = false;
+  }
+}
+
+// ---------- advertising state machine ----------
+namespace {
+  AdvMode desiredAdvMode() {
+    if (!s_init || s_suspended) return ADV_IDLE;
+    if (s_connected) return ADV_IDLE;
+    if (ble_radio::current() != ble_radio::MODE_HID &&
+        ble_radio::current() != ble_radio::MODE_NONE) return ADV_IDLE;
+    if (s_pairNew) return ADV_OPEN;
+    if (s_hasSelection) return ADV_WHITELIST;
+    return ADV_IDLE;
+  }
+
+  // Push the selected peer (or none) into the controller's whitelist.
+  // ble_gap_wl_set replaces the entire list, so calling with count=0 clears.
+  void applyWhitelist() {
+    if (s_hasSelection) {
+      ble_addr_t a;
+      memcpy(a.val, s_selectedAddr.getNative(), 6);
+      a.type = s_selectedAddr.getType();
+      int rc = ble_gap_wl_set(&a, 1);
+      Serial.printf("[hid] wl set %s type=%u -> %d\n",
+                    s_selectedAddr.toString().c_str(),
+                    (unsigned)a.type, rc);
+    } else {
+      ble_gap_wl_set(nullptr, 0);
+    }
+  }
+
+  void applyAdvState() {
+    if (!s_init) return;
+    NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+    if (!adv) return;
+
+    AdvMode want = desiredAdvMode();
+    if (want == s_currentAdv && want == ADV_IDLE) return;
+
+    if (ble_gap_adv_active()) adv->stop();
+    if (want == ADV_IDLE) { s_currentAdv = ADV_IDLE; return; }
+
+    installHidAdvData();
+    adv->setAdvertisementType(BLE_GAP_CONN_MODE_UND);
+    if (want == ADV_WHITELIST) {
+      applyWhitelist();
+      // setScanFilter(scanReqWl, connReqWl): only the whitelisted peer can
+      // open a connection. Scanners still see the device, so HID auto-reconnect
+      // on the host side picks it up normally.
+      adv->setScanFilter(false, true);
+    } else {  // ADV_OPEN (PAIR NEW)
+      ble_gap_wl_set(nullptr, 0);
+      adv->setScanFilter(false, false);
+    }
+    bool ok = adv->start();
+    Serial.printf("[hid] adv %s -> %d\n",
+                  want == ADV_WHITELIST ? "WL" : "OPEN", (int)ok);
+    s_currentAdv = want;
+  }
+}
+
+// Called by ble_radio when the radio returns to HID (e.g. ble_spam::stop).
+// Don't call NimBLE adv APIs synchronously from arbitrary contexts; just
+// trigger a reconverge on the next tick.
 static void radioRestoreHid() {
   if (!s_init) return;
-  reinstallAdvData();
-  if (!s_suspended) NimBLEDevice::startAdvertising();
+  s_currentAdv = ADV_IDLE;   // force tick() to re-emit
 }
 
 void begin(const char* name) {
   if (s_init) return;
   if (name) { strncpy(s_name, name, sizeof(s_name) - 1); s_name[sizeof(s_name) - 1] = 0; }
   NimBLEDevice::init(s_name);
-  // bond=yes, MITM=no, SC=no. Requiring SC here was rejecting BlueZ peers
-  // that negotiated LE Legacy → "Authentication failure" reconnect loops.
-  // Letting SMP pick its own mode is broader-compat without losing bonding.
+  // bond=yes, MITM=no, SC=no. SC=yes rejected BlueZ peers that fell back to
+  // LE Legacy → auth-failure reconnect loops. Letting SMP negotiate the mode
+  // is broader-compat without losing bonding.
   NimBLEDevice::setSecurityAuth(true, false, false);
-  NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);   // Just Works
+  NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
 
   s_server = NimBLEDevice::createServer();
   s_server->setCallbacks(&s_cb);
+  // Drive re-advertising from tick(), not from inside the disconnect handler.
+  // NimBLE's built-in auto-restart races with our state machine.
+  s_server->advertiseOnDisconnect(false);
 
   s_hid = new NimBLEHIDDevice(s_server);
   s_hid->manufacturer()->setValue("smartwatch");
@@ -244,97 +359,70 @@ void begin(const char* name) {
   s_input      = s_hid->inputReport(1);
   s_kbInput    = s_hid->inputReport(2);
   s_mouseInput = s_hid->inputReport(3);
+  ble_ota::begin(s_server);
   s_hid->startServices();
 
   s_init = true;
   ble_radio::init();
   ble_radio::setHidRestore(&radioRestoreHid);
   ble_radio::acquire(ble_radio::MODE_HID);
-  reinstallAdvData();   // canonical HID advertisement state
-  applySelection();     // configure whitelist + advertise
+  installHidAdvData();
+  dumpBonds("boot");
+
+  // Restore the last selected host. If the bond still exists, start the
+  // status timer so the UI shows "no response yet" after SELECT_TIMEOUT_MS.
+  loadSelected();
+  if (s_hasSelection) {
+    s_selectStartedMs = millis();
+    Serial.printf("[hid] restoring selection %s\n",
+                  s_selectedAddr.toString().c_str());
+  }
+  applyAdvState();
 }
 
-namespace { uint32_t s_advCooldownUntil = 0; }
 void tick() {
   if (!s_init || !s_server) return;
-  uint32_t now = millis();
-
-  // End-of-cooldown: resume advertising once a blacklisted peer has had time
-  // to back off. Without this the phone auto-reconnects faster than the
-  // watchdog can kick it and the user sees a flapping "paired/pair-new".
-  if (s_advCooldownUntil && (int32_t)(now - s_advCooldownUntil) >= 0
-      && !s_suspended) {
-    s_advCooldownUntil = 0;
-    NimBLEDevice::startAdvertising();
-  }
-
-  if (!s_connected) return;
-  static uint32_t lastMs = 0;
-  if (now - lastMs < 100) return;
-  lastMs = now;
-
-  // Build a NimBLEAddress set of blacklisted bonds *fresh each tick*: the
-  // string-based inBlacklist() was missing matches when toString()
-  // formatting differed between the bond store and live peer info. Compare
-  // via NimBLEAddress equality (operator==) which checks the underlying
-  // 6-byte value, not the rendered text.
-  int nb = NimBLEDevice::getNumBonds();
-  std::vector<NimBLEAddress> blAddrs;
-  for (int i = 0; i < nb; ++i) {
-    NimBLEAddress a = NimBLEDevice::getBondedAddress(i);
-    if (inBlacklist(a.toString().c_str())) blAddrs.push_back(a);
-  }
-
-  for (auto h : s_server->getPeerDevices()) {
-    NimBLEConnInfo info = s_server->getPeerInfo(h);
-    NimBLEAddress rpa = info.getAddress();
-    NimBLEAddress id  = info.getIdAddress();
-    bool match = false;
-    for (auto& b : blAddrs) {
-      if (b == rpa || b == id) { match = true; break; }
-    }
-    Serial.printf("[hid] watchdog peer rpa=%s id=%s match=%d bl=%u\n",
-                  rpa.toString().c_str(), id.toString().c_str(),
-                  (int)match, (unsigned)blAddrs.size());
-    if (match) {
-      s_server->disconnect(h);
-      NimBLEDevice::stopAdvertising();
-      s_advCooldownUntil = now + 3000;
-    }
-  }
+  applyAdvState();
 }
+
 bool connected() { return s_connected; }
 
-void startAdvertising() { if (s_init) NimBLEDevice::startAdvertising(); }
-void stopAdvertising()  { if (s_init) NimBLEDevice::stopAdvertising(); }
+void startAdvertising() {
+  // Public hook is kept for backward compat with screen_pair's PAIR NEW
+  // button. Internally we just request a state-machine reconverge.
+  if (!s_init) return;
+  s_currentAdv = ADV_IDLE;
+  applyAdvState();
+}
+void stopAdvertising() {
+  if (!s_init) return;
+  if (ble_gap_adv_active()) NimBLEDevice::stopAdvertising();
+  s_currentAdv = ADV_IDLE;
+}
 
 void suspend() {
   if (!s_init) return;
   s_suspended = true;
-  NimBLEDevice::stopAdvertising();
+  if (ble_gap_adv_active()) NimBLEDevice::stopAdvertising();
+  s_currentAdv = ADV_IDLE;
   if (s_server) {
     for (auto h : s_server->getPeerDevices()) s_server->disconnect(h);
   }
-  // 2 ms scheduler yield (NOT a no-op) so the NimBLE host task gets a
-  // chance to actually process the disconnect before the next caller
-  // touches the radio. Callers that share the radio (e.g. BLE spam) go
-  // through ble_radio::acquire(), which is safe even mid-teardown.
+  // Yield so NimBLE host can actually process the disconnect.
   vTaskDelay(pdMS_TO_TICKS(2));
 }
 
 void resume() {
   if (!s_init) return;
   s_suspended = false;
-  // Hand the radio back to HID. The arbiter calls radioRestoreHid, which
-  // reinstalls the connectable HID advertisement and starts advertising.
   ble_radio::acquire(ble_radio::MODE_HID);
-  reinstallAdvData();
-  NimBLEDevice::startAdvertising();
+  // Reset the status timer so the UI shows "still trying" again rather than
+  // an immediately-failed state after spam returns the radio.
+  if (s_hasSelection && !s_connected) s_selectStartedMs = millis();
+  applyAdvState();
 }
 
 namespace {
-  // Single shared buffer for any addr/string returned to UI code. UI must
-  // copy before calling another bond accessor.
   char s_addrBuf[20] = {0};
 }
 
@@ -350,7 +438,6 @@ const char* peerAddr() {
   if (!s_init || !s_connected || !s_server) { s_addrBuf[0] = 0; return s_addrBuf; }
   auto peers = s_server->getPeerDevices();
   if (peers.empty()) { s_addrBuf[0] = 0; return s_addrBuf; }
-  // 1.4.3: getPeerDevices returns std::vector<uint16_t> of conn handles
   NimBLEConnInfo info = s_server->getPeerInfo(peers[0]);
   std::string a = info.getAddress().toString();
   strncpy(s_addrBuf, a.c_str(), sizeof(s_addrBuf) - 1);
@@ -358,17 +445,10 @@ const char* peerAddr() {
   return s_addrBuf;
 }
 
-bool peerBlacklisted() {
-  if (!s_init || !s_connected || !s_server) return false;
-  for (auto h : s_server->getPeerDevices()) {
-    NimBLEConnInfo info = s_server->getPeerInfo(h);
-    std::string idAddr = info.getIdAddress().toString();
-    std::string addr   = info.getAddress().toString();
-    if ((!idAddr.empty() && inBlacklist(idAddr.c_str())) ||
-        (!addr.empty()   && inBlacklist(addr.c_str()))) return true;
-  }
-  return false;
-}
+// Retained for API compatibility with screen_pair. In the new model there is
+// no blacklist — single-selected-host means only the selected peer can
+// connect (via directed adv) or anyone can (pair-new). Always false.
+bool peerBlacklisted() { return false; }
 
 uint8_t numBonds() {
   if (!s_init) return 0;
@@ -383,15 +463,6 @@ const char* bondAddr(uint8_t i) {
   strncpy(s_addrBuf, s.c_str(), sizeof(s_addrBuf) - 1);
   s_addrBuf[sizeof(s_addrBuf) - 1] = 0;
   return s_addrBuf;
-}
-
-namespace {
-  // NVS key from address: strip colons -> 12 hex chars (fits NVS 15-char limit).
-  void addrKey(const char* addr, char out[16]) {
-    int j = 0;
-    for (int k = 0; addr[k] && j < 15; ++k) if (addr[k] != ':') out[j++] = addr[k];
-    out[j] = 0;
-  }
 }
 
 const char* bondName(uint8_t i) {
@@ -420,19 +491,24 @@ void setBondName(uint8_t i, const char* name) {
 void forget(uint8_t i) {
   if (!s_init || i >= numBonds()) return;
   NimBLEAddress a = NimBLEDevice::getBondedAddress(i);
-  std::string addrStr = a.toString();
   if (s_server) {
     for (auto h : s_server->getPeerDevices()) {
       NimBLEConnInfo info = s_server->getPeerInfo(h);
-      if (info.getAddress() == a) s_server->disconnect(h);
+      if (info.getAddress() == a || info.getIdAddress() == a) {
+        s_server->disconnect(h);
+      }
     }
   }
+  // If this was the selected host, clear selection.
+  if (s_hasSelection && s_selectedAddr == a) {
+    s_hasSelection = false;
+    s_selectStartedMs = 0;
+    persistSelected();
+  }
   NimBLEDevice::deleteBond(a);
-  // applySelection() prunes blacklist entries whose bond no longer exists
-  // and persists the result, so dropping this addr from the blacklist
-  // happens automatically inside it.
-  applySelection();
   dumpBonds("forget");
+  s_currentAdv = ADV_IDLE;
+  applyAdvState();
 }
 
 void forgetAll() {
@@ -441,169 +517,106 @@ void forgetAll() {
     for (auto h : s_server->getPeerDevices()) s_server->disconnect(h);
   }
   NimBLEDevice::deleteAllBonds();
-  clearSelection();   // also calls applySelection()
+  s_hasSelection = false;
+  s_selectStartedMs = 0;
+  s_pairNew = false;
+  persistSelected();
   dumpBonds("forgetAll");
+  s_currentAdv = ADV_IDLE;
+  applyAdvState();
 }
 
-namespace {
-  // Blacklist: addresses of bonded peers the user has unchecked. A bond not
-  // in this set is "allowed" (checked) — default state for any newly-bonded
-  // device. Persisted in NVS as a newline-separated string under key "bl".
-  std::vector<std::string> s_blacklist;
-  bool s_blLoaded = false;
+// ---------- selection API ----------
+// "Selected" bond = the one host the watch is currently advertising to with
+// a connection-filter whitelist. At most one at a time.
 
-  void loadBlacklist() {
-    s_blacklist.clear();
-    Preferences p;
-    if (!p.begin("bondsel", true)) { s_blLoaded = true; return; }
-    String s = p.getString("bl", "");
-    p.end();
-    int start = 0;
-    for (int i = 0; i <= s.length(); ++i) {
-      if (i == s.length() || s[i] == '\n') {
-        if (i > start) s_blacklist.emplace_back(s.c_str() + start, i - start);
-        start = i + 1;
-      }
-    }
-    s_blLoaded = true;
-  }
-  void storeBlacklist() {
-    Preferences p;
-    if (!p.begin("bondsel", false)) return;
-    if (s_blacklist.empty()) {
-      p.remove("bl");
-    } else {
-      String joined;
-      for (size_t i = 0; i < s_blacklist.size(); ++i) {
-        if (i) joined += '\n';
-        joined += s_blacklist[i].c_str();
-      }
-      p.putString("bl", joined);
-    }
-    p.end();
-  }
-  bool inBlacklist(const char* addr) {
-    if (!addr || !addr[0]) return false;
-    for (auto& s : s_blacklist) if (s == addr) return true;
-    return false;
-  }
-  void blacklistAdd(const char* addr) {
-    if (!addr || !addr[0]) return;
-    if (inBlacklist(addr)) return;
-    s_blacklist.emplace_back(addr);
-    storeBlacklist();
-  }
-  void blacklistRemove(const char* addr) {
-    if (!addr || !addr[0]) return;
-    for (auto it = s_blacklist.begin(); it != s_blacklist.end(); ++it) {
-      if (*it == addr) { s_blacklist.erase(it); storeBlacklist(); return; }
-    }
-  }
+bool isSelected(uint8_t i) {
+  if (!s_init || i >= numBonds() || !s_hasSelection) return false;
+  return NimBLEDevice::getBondedAddress(i) == s_selectedAddr;
 }
 
-// Prune blacklist entries whose bond no longer exists, then re-advertise.
-// Connection gating is done in tick() so it can wait for IRK resolution.
-void applySelection() {
-  if (!s_init) return;
-  if (!s_blLoaded) loadBlacklist();
+void selectBond(uint8_t i) {
+  if (!s_init || i >= numBonds()) return;
+  NimBLEAddress a = NimBLEDevice::getBondedAddress(i);
 
-  // Drop stale blacklist entries (bonds that have since been forgotten).
-  std::vector<std::string> live;
-  int n = NimBLEDevice::getNumBonds();
-  for (int i = 0; i < n; ++i) {
-    std::string a = NimBLEDevice::getBondedAddress(i).toString();
-    if (inBlacklist(a.c_str())) live.push_back(a);
-  }
-  if (live.size() != s_blacklist.size()) {
-    s_blacklist = std::move(live);
-    storeBlacklist();
-  }
-  Serial.printf("[hid] applySelection bonds=%d blacklist=%u suspended=%d\n",
-                n, (unsigned)s_blacklist.size(), (int)s_suspended);
-
-  NimBLEDevice::stopAdvertising();
-  reinstallAdvData();
-  NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
-  // No whitelist filter — we want any device (including the brand-new one
-  // PAIR NEW is about to talk to) to be able to initiate. Blacklist
-  // enforcement happens in tick() after the connection is authenticated.
-  adv->setScanFilter(false, false);
-
-  // Kick any currently-connected peer whose identity matches a blacklist.
-  if (s_server) {
+  // If currently connected to a different peer, hang up so the new
+  // whitelist takes effect cleanly.
+  if (s_connected && s_server) {
     for (auto h : s_server->getPeerDevices()) {
       NimBLEConnInfo info = s_server->getPeerInfo(h);
-      std::string idAddr = info.getIdAddress().toString();
-      std::string addr   = info.getAddress().toString();
-      if (inBlacklist(idAddr.c_str()) || inBlacklist(addr.c_str())) {
+      if (!(info.getAddress() == a || info.getIdAddress() == a)) {
         s_server->disconnect(h);
       }
     }
   }
 
-  if (!s_suspended) {
-    bool ok = NimBLEDevice::startAdvertising();
-    Serial.printf("[hid] startAdvertising -> %d\n", (int)ok);
-  } else {
-    Serial.println("[hid] advertising NOT started (suspended)");
-  }
-}
-
-bool isSelected(uint8_t i) {
-  if (!s_init || i >= numBonds()) return false;
-  if (!s_blLoaded) loadBlacklist();
-  std::string a = NimBLEDevice::getBondedAddress(i).toString();
-  return !inBlacklist(a.c_str());
-}
-
-void selectBond(uint8_t i) {
-  if (!s_init || i >= numBonds()) return;
-  if (!s_blLoaded) loadBlacklist();
-  std::string a = NimBLEDevice::getBondedAddress(i).toString();
-  blacklistRemove(a.c_str());
-  applySelection();
+  s_selectedAddr = a;
+  s_hasSelection = true;
+  s_pairNew = false;
+  s_selectStartedMs = millis();
+  persistSelected();
+  s_currentAdv = ADV_IDLE;   // force re-apply with the new whitelist
+  applyAdvState();
 }
 
 void deselectBond(uint8_t i) {
   if (!s_init || i >= numBonds()) return;
-  if (!s_blLoaded) loadBlacklist();
-  std::string a = NimBLEDevice::getBondedAddress(i).toString();
-  blacklistAdd(a.c_str());
-  applySelection();   // also kicks the peer if it's currently connected
+  NimBLEAddress a = NimBLEDevice::getBondedAddress(i);
+  if (!s_hasSelection || !(s_selectedAddr == a)) return;
+  s_hasSelection = false;
+  s_selectStartedMs = 0;
+  persistSelected();
+  // If currently connected to this peer, leave the link alone — the user
+  // unchecking a row means "stop trying", not "kick the active host".
+  s_currentAdv = ADV_IDLE;
+  applyAdvState();
 }
 
-bool pairNewMode() {
-  if (!s_init) return false;
-  if (!s_blLoaded) loadBlacklist();
-  int n = NimBLEDevice::getNumBonds();
-  return n > 0 && (int)s_blacklist.size() >= n;
+bool pairNewMode() { return s_pairNew; }
+
+bool reconnecting() {
+  if (!s_hasSelection || s_connected) return false;
+  uint32_t elapsed = millis() - s_selectStartedMs;
+  return elapsed < SELECT_TIMEOUT_MS;
+}
+
+bool reconnectFailed() {
+  if (!s_hasSelection || s_connected) return false;
+  return (millis() - s_selectStartedMs) >= SELECT_TIMEOUT_MS;
+}
+
+void retrySelection() {
+  if (!s_init || !s_hasSelection) return;
+  s_selectStartedMs = millis();
+  s_currentAdv = ADV_IDLE;
+  applyAdvState();
 }
 
 void exitPairNewMode() {
   if (!s_init) return;
-  if (!s_blLoaded) loadBlacklist();
-  s_blacklist.clear();
-  storeBlacklist();
-  applySelection();
+  s_pairNew = false;
+  s_currentAdv = ADV_IDLE;
+  applyAdvState();
 }
 
-// PAIR NEW: blacklist every existing bond. The new device (not yet bonded)
-// can still connect because it isn't on the list. Once paired, the new
-// bond is allowed by default (not in blacklist).
+// PAIR NEW: open advertising (no whitelist filter), accept any peer. Clears
+// selection so a fresh peer doesn't get blocked by the connection filter.
 void clearSelection() {
   if (!s_init) return;
-  if (!s_blLoaded) loadBlacklist();
-  s_blacklist.clear();
-  int n = NimBLEDevice::getNumBonds();
-  for (int i = 0; i < n; ++i) {
-    std::string a = NimBLEDevice::getBondedAddress(i).toString();
-    s_blacklist.push_back(a);
+  // If currently connected to a known bond, hang up — the user wants a
+  // fresh pairing and the existing host would otherwise lock the radio.
+  if (s_connected && s_server) {
+    for (auto h : s_server->getPeerDevices()) s_server->disconnect(h);
   }
-  storeBlacklist();
-  applySelection();
+  s_pairNew = true;
+  s_hasSelection = false;
+  s_selectStartedMs = 0;
+  persistSelected();
+  s_currentAdv = ADV_IDLE;
+  applyAdvState();
 }
 
-
+// ---------- HID input methods ----------
 void playPause() { sendBit(B_PLAY); }
 void next()      { sendBit(B_NEXT); }
 void prev()      { sendBit(B_PREV); }
@@ -620,11 +633,6 @@ void right()  { sendKey(0x4F); }
 void select() { sendKey(0x28); }
 void escape() { sendKey(0x29); }
 
-// Trackpad: motion + click + scroll. The trackpad screen sends a stream of
-// these every poll, so we DON'T schedule auto-releases for move/scroll —
-// those are inherently transient (zero is the resting state). Clicks DO
-// schedule a release so a tap on the pad lands a clean press+release on
-// the host without the screen having to manage timing.
 static void sendMouse(uint8_t buttons, int8_t dx, int8_t dy, int8_t wheel) {
   if (!s_connected || !s_mouseInput) return;
   uint8_t r[4] = { buttons, (uint8_t)dx, (uint8_t)dy, (uint8_t)wheel };
@@ -649,7 +657,7 @@ void mousePress(uint8_t button) {
   if (!s_connected || !s_mouseInput) return;
   if (s_release) { lv_timer_delete(s_release); s_release = nullptr; }
   sendMouse(button, 0, 0, 0);
-  s_pending = Pending::Mouse;   // release deferred until mouseRelease()
+  s_pending = Pending::Mouse;
 }
 void mouseRelease() {
   if (s_pending == Pending::Mouse) flushRelease();

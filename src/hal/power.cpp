@@ -6,8 +6,10 @@
 #include <Arduino.h>
 #include <Preferences.h>
 #include <esp_pm.h>
+#include <esp_sleep.h>
 #include <driver/gpio.h>
 #include <tusb.h>
+#include <WiFi.h>
 
 namespace {
   enum class St { Bright, Dim, Asleep };
@@ -58,9 +60,13 @@ void init() {
   // suspend — which the host issues routinely on idle CDC devices —
   // even though the cable is still physically plugged in.
   bool usbAttached = tud_mounted();
+  // min_freq_mhz = 10 lets DFS drop the CPU to the XTAL during idle windows,
+  // which is a much bigger win than the 80 MHz floor — at 80 MHz the chip
+  // still pulls tens of mA when "idle." The PM driver scales back up
+  // automatically on interrupt / RTOS wake.
   esp_pm_config_esp32s3_t pm = {
     .max_freq_mhz = 240,
-    .min_freq_mhz = 80,
+    .min_freq_mhz = 10,
     .light_sleep_enable = !usbAttached,
   };
   esp_err_t e = esp_pm_configure(&pm);
@@ -78,6 +84,7 @@ void init() {
 uint16_t batteryMv()  { return s_batMv; }
 uint8_t  batteryPct() { return mvToPct(s_batMv); }
 bool     batteryLow() { return s_batMv && s_batMv < BAT_MV_LOW; }
+bool     charging()   { return tud_mounted(); }
 
 void noteActivity() {
   s_lastSeen = millis();
@@ -108,10 +115,26 @@ void setBrightness(uint8_t v) {
   if (p.begin("power", false)) { p.putUChar("bright", s_bright); p.end(); }
 }
 
+void powerOff() {
+  // Drop the backlight and put the panel to sleep so nothing bright lingers
+  // during the millisecond between here and esp_deep_sleep_start().
+  disp::setBacklight(0);
+  disp::sleepPanel();
+
+  // Deep sleep cuts power to the WiFi/BT modems automatically, but a clean
+  // disconnect avoids leaving the AP/peer wondering where we went.
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_OFF);
+
+  // No wake source configured — the chip resumes only on EN/reset.
+  esp_deep_sleep_start();
+}
+
 void tick() {
-  // Battery: re-sample every 5s. Cheap enough to do unconditionally.
+  // Battery: re-sample every 30s. The ADC + EMA settles fine at this rate
+  // for a status icon, and the saved ticks compound to meaningful idle time.
   uint32_t now = millis();
-  if (now - s_batLastMs >= 5000) { s_batLastMs = now; sampleBattery(); }
+  if (now - s_batLastMs >= 30000) { s_batLastMs = now; sampleBattery(); }
 
   // Touch activity (tracked by the indev) resets the idle timer from any state.
   static uint32_t prevActivity = 0;

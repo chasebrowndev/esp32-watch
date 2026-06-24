@@ -42,4 +42,9 @@ namespace wifi {
   void        suspend();
   void        resume();
   bool        suspended();
+
+  // Power the radio fully off (WIFI_OFF) and stop the reconnect loop. Used
+  // by main.cpp after NTP sync completes to save battery — wifi is otherwise
+  // only needed for time sync on this firmware. resume() brings it back.
+  void        shutdown();
 }

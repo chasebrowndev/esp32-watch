@@ -32,6 +32,9 @@ namespace ui {
   void init();
   void tick();
   void openApp(App a);
+  // Pop one level off the navigation back-stack. If the stack is empty,
+  // closes the overlay entirely. Used by the back-arrow button.
+  void goBack();
   void closeApp();
 
   // Destroy and recreate the watchface tile content. Called by theme::/faces::

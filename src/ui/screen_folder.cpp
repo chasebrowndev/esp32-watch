@@ -4,20 +4,12 @@
 #include <lvgl.h>
 
 namespace {
-  // Closing+reopening synchronously inside an LVGL event handler would delete
-  // the button's parent overlay while LVGL still has it on the dispatch stack.
-  // Defer the swap to the next LVGL tick via a one-shot timer so the current
-  // event finishes unwinding before any widgets are freed.
-  void deferred_open(lv_timer_t* t) {
-    ui::App a = (ui::App)(uintptr_t)lv_timer_get_user_data(t);
-    ui::closeApp();
-    ui::openApp(a);
-    lv_timer_delete(t);
-  }
+  // ui::openApp() pushes the current folder onto the navigation back-stack
+  // and defers the actual overlay swap to the next LVGL tick, so it's safe
+  // to call directly from inside an event handler.
   void cb_sub(lv_event_t* e) {
     ui::App a = (ui::App)(uintptr_t)lv_event_get_user_data(e);
-    lv_timer_t* t = lv_timer_create(deferred_open, 0, (void*)(uintptr_t)a);
-    lv_timer_set_repeat_count(t, 1);
+    ui::openApp(a);
   }
 }
 

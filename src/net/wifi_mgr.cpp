@@ -228,8 +228,11 @@ void suspend() {
   // Drop the current association so the next driver caller starts clean,
   // but keep the radio powered on — the scanner stays in STA mode and
   // an immediate WiFi.scanNetworks() would otherwise fail with no radio.
+  // No delay here: blocking the LVGL loop on screen entry stalls touches
+  // and animations. The driver event loop runs on its own task and the
+  // disassociate completes asynchronously — the next caller (scan or AP
+  // start) is fine without us spin-waiting.
   WiFi.disconnect(false, true);
-  delay(100);
 }
 void resume() {
   if (!s_suspended) return;
@@ -240,5 +243,13 @@ void resume() {
   if (s_count) beginIndex(s_tryIdx);
 }
 bool suspended() { return s_suspended; }
+
+void shutdown() {
+  // Fully power down the radio. Distinct from suspend(), which keeps the
+  // PHY hot so scan/promiscuous callers can run without re-init.
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_OFF);
+  s_suspended = true;
+}
 
 } // namespace wifi

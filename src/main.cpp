@@ -14,6 +14,11 @@
 #include "net/sntp.h"
 #include <ArduinoOTA.h>
 static bool s_ota_started = false;
+// Wifi is only needed until NTP syncs; after that we power the radio off to
+// save battery. Cleared on first sync (or up-front if no saved networks).
+// Re-enabling wifi via the settings screen is unaffected — this gate only
+// governs the automatic boot-time sync window.
+static bool s_wifi_needed = true;
 #endif
 #if FEAT_BLE_HID
 #include "features/ble_hid.h"
@@ -56,6 +61,13 @@ void setup() {
   ArduinoOTA.onError([](ota_error_t e) {
     Serial.printf("[ota] error %u\n", e);
   });
+  // No saved networks means we can't ever sync; cut the radio now so we
+  // don't sit in STA mode burning power until the user adds one.
+  if (!wifi::savedCount()) {
+    Serial.println(F("[wifi] no saved networks; radio off"));
+    wifi::shutdown();
+    s_wifi_needed = false;
+  }
 #endif
 
 #if FEAT_BLE_HID
@@ -83,14 +95,24 @@ void setup() {
 void loop() {
   lv_timer_handler();   // LVGL render + indev
 #if FEAT_WIFI
-  wifi::tick();         // reconnect/backoff
-  ntp::tick();          // (re)sync time on connect
-  if (!s_ota_started && wifi::connected()) {
-    ArduinoOTA.begin();
-    s_ota_started = true;
-    Serial.println(F("[ota] listening on smartwatch.local"));
+  if (s_wifi_needed) {
+    wifi::tick();         // reconnect/backoff
+    ntp::tick();          // (re)sync time on connect
+    if (!s_ota_started && wifi::connected()) {
+      ArduinoOTA.begin();
+      s_ota_started = true;
+      Serial.println(F("[ota] listening on smartwatch.local"));
+    }
+    if (s_ota_started) ArduinoOTA.handle();
+    // Once the clock is real, drop the radio. ESP32 RTC keeps time across
+    // the rest of the boot, so we don't need wifi up again until reboot.
+    if (ntp::synced()) {
+      Serial.println(F("[wifi] time synced; radio off"));
+      wifi::shutdown();
+      s_ota_started = false;
+      s_wifi_needed = false;
+    }
   }
-  if (s_ota_started) ArduinoOTA.handle();
 #endif
 #if FEAT_BLE_HID
   ble_hid::tick();

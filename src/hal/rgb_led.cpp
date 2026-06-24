@@ -41,7 +41,10 @@ void tick() {
   // dark unless the screen is off.
   if (!power::asleep()) { write(0, 0, 0); return; }
 
-  // Priority order: low-battery alarm > spam > paired > advertising > off.
+  // During sleep, only light up for things the user actually needs to know
+  // about. The "connected" steady green and "advertising" breathing blue
+  // used to run here continuously — that's a constant WS2812 draw for no
+  // useful signal (the user is, by definition, not looking at the watch).
   bool blinkSlow = ((now / 1000) & 1);
   bool blinkFast = ((now / 200)  & 1);
 
@@ -55,13 +58,7 @@ void tick() {
     return;
   }
 #endif
-#if FEAT_BLE_HID
-  if (ble_hid::connected()) { write(0, 6, 0); return; }   // steady dim green
-  write(0, 0, blinkSlow ? 6 : 1);                          // breathing blue
-  return;
-#else
   write(0, 0, 0);
-#endif
 }
 
 } // namespace rgb_led

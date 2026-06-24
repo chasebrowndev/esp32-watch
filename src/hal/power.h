@@ -10,6 +10,11 @@ namespace power {
   void wake();         // force wake (e.g. on notification)
   void noteActivity(); // reset idle timer (called on touch)
 
+  // Power the chip off until EN/reset is pressed. No wake sources are
+  // configured, so touch, USB plug-in, and timers will not bring it back.
+  // Intended for overnight charging.
+  void powerOff();
+
   // User-tunable bright-level (0..255). Persists in NVS; takes effect immediately.
   uint8_t brightness();
   void    setBrightness(uint8_t v);
@@ -18,4 +23,5 @@ namespace power {
   uint16_t batteryMv();   // battery voltage in mV (after divider correction)
   uint8_t  batteryPct();  // 0..100, piecewise LiPo curve
   bool     batteryLow();  // true under BAT_MV_LOW
+  bool     charging();    // USB attached (host is supplying power)
 }

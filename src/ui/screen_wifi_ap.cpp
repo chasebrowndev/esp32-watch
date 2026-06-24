@@ -31,6 +31,9 @@ static lv_obj_t* s_editPane = nullptr;
 static lv_obj_t* s_editTa   = nullptr;
 static lv_obj_t* s_kb       = nullptr;
 static char      s_curSsid[33] = {0};
+// Non-blocking deferred-start: scan kicked off, captive::start fires from
+// an lv_timer after the scan window so the UI stays responsive.
+static lv_timer_t* s_startDefer = nullptr;
 
 static const char* SSID_POOL_DEFAULT[] = {
   "FREE WIFI",
@@ -106,6 +109,15 @@ static void refreshToggleLabel() {
   if (l) lv_label_set_text(l, captive::running() ? "STOP" : "START");
 }
 
+static void deferredStartCb(lv_timer_t* t) {
+  pickSsid(s_curSsid, sizeof(s_curSsid));
+  captive::start(s_curSsid);
+  if (s_ssidLbl) lv_label_set_text_fmt(s_ssidLbl, "ssid: %s", s_curSsid);
+  refreshToggleLabel();
+  lv_timer_delete(t);
+  s_startDefer = nullptr;
+}
+
 static void apStart() {
   // Custom takes precedence: if the user typed something into the textarea,
   // use it verbatim and skip the scan-and-clone path.
@@ -113,19 +125,23 @@ static void apStart() {
   if (custom && custom[0]) {
     strncpy(s_curSsid, custom, sizeof(s_curSsid) - 1);
     s_curSsid[sizeof(s_curSsid) - 1] = 0;
-  } else {
-    // Kick a scan first so SSID-cloning has something to pick from. Best-effort
-    // — if results aren't ready by the time we sample, we fall back to the pool.
-    WiFi.mode(WIFI_STA);
-    wifi::scanStart();
-    delay(800);   // small window to let the scan return something usable
-    pickSsid(s_curSsid, sizeof(s_curSsid));
+    captive::start(s_curSsid);
+    if (s_ssidLbl) lv_label_set_text_fmt(s_ssidLbl, "ssid: %s", s_curSsid);
+    refreshToggleLabel();
+    return;
   }
-  captive::start(s_curSsid);
-  if (s_ssidLbl) lv_label_set_text_fmt(s_ssidLbl, "ssid: %s", s_curSsid);
-  refreshToggleLabel();
+  // Kick a scan and defer captive::start by ~800 ms via an lv_timer so the
+  // UI keeps rendering and touch responds. If the user toggles OFF before
+  // the timer fires, cb_destroy / apStop cancels it.
+  WiFi.mode(WIFI_STA);
+  wifi::scanStart();
+  if (s_ssidLbl) lv_label_set_text(s_ssidLbl, "ssid: scanning...");
+  if (s_startDefer) { lv_timer_delete(s_startDefer); s_startDefer = nullptr; }
+  s_startDefer = lv_timer_create(deferredStartCb, 800, nullptr);
+  lv_timer_set_repeat_count(s_startDefer, 1);
 }
 static void apStop() {
+  if (s_startDefer) { lv_timer_delete(s_startDefer); s_startDefer = nullptr; }
   captive::stop();
   s_curSsid[0] = 0;
   if (s_ssidLbl) lv_label_set_text(s_ssidLbl, "ssid: (off)");
@@ -165,6 +181,7 @@ static void cb_kb(lv_event_t* e) {
 
 static void cb_destroy(lv_event_t*) {
 #if FEAT_WIFI
+  if (s_startDefer) { lv_timer_delete(s_startDefer); s_startDefer = nullptr; }
   captive::stop();
   wifi::resume();
 #endif

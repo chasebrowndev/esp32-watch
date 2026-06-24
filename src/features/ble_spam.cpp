@@ -216,39 +216,36 @@ namespace {
     return i;
   }
 
-  // Rotate the controller's own (random static) address. Without this,
-  // every spam frame goes out from the same BD_ADDR — most modern phones
-  // and Apple Continuity dedup by BD_ADDR + payload and ignore repeats.
-  // NimBLE 1.4.3 lets us set a random static address via setOwnAddr().
-  void rotateAddr() {
+  // Set the controller's own (random static) address. Without rotating
+  // this, every spam frame goes out from the same BD_ADDR — most modern
+  // phones and Apple Continuity dedup by BD_ADDR + payload and ignore
+  // repeats. Caller MUST ensure the advertiser is stopped before calling;
+  // ble_hs_id_set_rnd is rejected while the controller is advertising.
+  void setRandomAddr() {
     uint8_t a[6];
     for (int i = 0; i < 6; ++i) a[i] = (uint8_t)esp_random();
     a[5] |= 0xC0;   // top two bits = 11 marks "static random"
-    // NimBLE-Arduino 1.4.3 doesn't expose a setter; reach into the host
-    // identity directly. This must be called while NOT advertising.
-    NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
-    bool wasOn = adv && adv->isAdvertising();
-    if (wasOn) adv->stop();
     ble_hs_id_set_rnd(a);
-    if (wasOn) adv->start();
   }
 
+  // Single per-beat path: stop, rotate addr, install fresh payload, start.
+  // Setting payload BEFORE start() guarantees the on-air frame carries the
+  // new address AND the new payload together; doing it after start (the
+  // previous order) left a brief window where the new MAC was paired with
+  // the previous beat's payload — visible as duplicate-dedup misses on
+  // some targets.
   bool pushAdv(const uint8_t* data, size_t len) {
     NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
     if (!adv) return false;
-    // NimBLE re-arms automatically when setAdvertisementData is called on
-    // an already-running advertiser, so we don't stop/start every cycle.
-    // First cycle (s_lastMs==0) does the one-time configure + start.
+    if (adv->isAdvertising()) adv->stop();
+    setRandomAddr();
     NimBLEAdvertisementData d;
     d.addData((char*)data, len);
     adv->setAdvertisementData(d);
-    if (s_lastMs == 0) {
-      adv->setAdvertisementType(BLE_GAP_CONN_MODE_NON);
-      adv->setMinInterval(0x20);
-      adv->setMaxInterval(0x20);
-      if (!adv->start()) return false;
-    }
-    return true;
+    adv->setAdvertisementType(BLE_GAP_CONN_MODE_NON);
+    adv->setMinInterval(0x20);
+    adv->setMaxInterval(0x20);
+    return adv->start();
   }
 
   void beat() {
@@ -276,7 +273,6 @@ namespace {
         break;
     }
 
-    rotateAddr();
     bool ok = pushAdv(buf, len);
     if (ok) s_txCount++;
     if ((s_txCount % 50) == 0) {
@@ -300,6 +296,11 @@ void start(Mode m) {
   s_mode = (m < MODE_COUNT) ? m : ALL;
   ble_hid::suspend();
   ble_radio::acquire(ble_radio::MODE_SPAM);
+  // Advertising default is BLE_OWN_ADDR_PUBLIC, which means ble_hs_id_set_rnd
+  // is a no-op on air and every spam frame carries the same BD_ADDR — modern
+  // OS continuity dedup throws away repeats. Switch to RANDOM so the rotated
+  // address actually goes out; restore PUBLIC in stop() for HID.
+  NimBLEDevice::setOwnAddrType(BLE_OWN_ADDR_RANDOM);
   s_active  = true;
   s_lastMs  = 0;
   s_txCount = 0;
@@ -309,6 +310,7 @@ void stop() {
   if (!s_active) return;
   NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
   if (adv) adv->stop();
+  NimBLEDevice::setOwnAddrType(BLE_OWN_ADDR_PUBLIC);
   s_active = false;
   // Releasing the radio fires the HID restore fn the arbiter has on file,
   // which reinstalls connectable HID adv data + starts advertising. This

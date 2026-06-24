@@ -46,11 +46,17 @@ void tick() {
   }
 
   uint8_t pct = power::batteryPct();
-  char bb[24];
-  snprintf(bb, sizeof(bb), "%s  %u%%", batSymbol(pct), pct);
+  char bb[32];
+  if (power::charging()) {
+    snprintf(bb, sizeof(bb), LV_SYMBOL_CHARGE " %s  %u%%", batSymbol(pct), pct);
+  } else {
+    snprintf(bb, sizeof(bb), "%s  %u%%", batSymbol(pct), pct);
+  }
   lv_label_set_text(s_bat, bb);
-  lv_obj_set_style_text_color(
-    s_bat, lv_color_hex(power::batteryLow() ? UI_RED : UI_DIM), LV_PART_MAIN);
+  uint32_t color = power::batteryLow() ? UI_RED
+                 : power::charging()   ? UI_FG
+                                       : UI_DIM;
+  lv_obj_set_style_text_color(s_bat, lv_color_hex(color), LV_PART_MAIN);
 }
 
 } // namespace face_digital

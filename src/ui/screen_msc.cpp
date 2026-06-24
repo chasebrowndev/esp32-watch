@@ -67,6 +67,9 @@ void tick() {
   }
 
 #if FEAT_USB_MSC
+  // SD is mounted: clear any DISABLED state that was set during a prior
+  // unmount so the user can toggle again without reopening the screen.
+  if (s_sw) lv_obj_clear_state(s_sw, LV_STATE_DISABLED);
   lv_label_set_text(s_status, usb_msc::enabled() ? "PRESENTING" : "ready");
 #else
   lv_label_set_text(s_status, "disabled");

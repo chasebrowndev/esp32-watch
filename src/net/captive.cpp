@@ -209,6 +209,11 @@ bool start(const char* ssid) {
   s_hitCount = 0;
   for (uint8_t i = 0; i < CAP_MAX; ++i) s_hits[i] = Hit{};
 
+  // See files_http::start for the rationale: full radio reset before AP, then
+  // set_mac (mode is set but radio not started), then softAP, then config.
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_OFF);
+  delay(50);
   WiFi.mode(WIFI_AP);
   // Random locally-administered MAC per start so the AP doesn't show up as
   // the same BSSID across sessions (helps avoid client-side "remembered
@@ -218,10 +223,10 @@ bool start(const char* ssid) {
   for (int i = 0; i < 6; ++i) mac[i] = (uint8_t)esp_random();
   mac[0] = (mac[0] & 0xFC) | 0x02;
   esp_wifi_set_mac(WIFI_IF_AP, mac);
+  if (!WiFi.softAP(ssid ? ssid : "smartwatch", nullptr)) return false;
   WiFi.softAPConfig(IPAddress(192, 168, 4, 1),
                     IPAddress(192, 168, 4, 1),
                     IPAddress(255, 255, 255, 0));
-  if (!WiFi.softAP(ssid ? ssid : "smartwatch", nullptr)) return false;
 
   s_dns = new DNSServer();
   s_dns->setErrorReplyCode(DNSReplyCode::NoError);

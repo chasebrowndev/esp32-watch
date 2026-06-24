@@ -33,7 +33,41 @@ static lv_obj_t* s_faceTile = nullptr;
 static lv_obj_t* s_overlay = nullptr;
 static ui::App   s_active  = ui::APP_NONE;
 
-static void cb_back(lv_event_t*) { ui::closeApp(); }
+// Navigation back-stack. Pushed by openApp() when called while another app
+// is already on screen (e.g. tapping a folder entry); popped by goBack().
+// Reset on closeApp() so a fresh drawer→app journey starts empty.
+static ui::App s_stack[8];
+static uint8_t s_stackTop = 0;
+
+// One-shot deferred app switch. Tearing down the current overlay
+// synchronously inside an LVGL event handler frees a parent that LVGL still
+// has on its dispatch stack, so the swap is scheduled on the next tick.
+static ui::App s_pendingNext = ui::APP_NONE;
+static bool    s_pendingPush = false;
+
+static void buildOverlay(ui::App a);
+static void teardownOverlay();
+
+static void deferred_switch(lv_timer_t* t) {
+  ui::App next = s_pendingNext;
+  bool    push = s_pendingPush;
+  s_pendingNext = ui::APP_NONE;
+  if (push && s_active != ui::APP_NONE && s_stackTop < 8) {
+    s_stack[s_stackTop++] = s_active;
+  }
+  teardownOverlay();
+  buildOverlay(next);
+  lv_timer_delete(t);
+}
+
+static void scheduleSwitch(ui::App next, bool push) {
+  s_pendingNext = next;
+  s_pendingPush = push;
+  lv_timer_t* t = lv_timer_create(deferred_switch, 0, nullptr);
+  lv_timer_set_repeat_count(t, 1);
+}
+
+static void cb_back(lv_event_t*) { ui::goBack(); }
 
 namespace ui {
 
@@ -70,8 +104,10 @@ void init() {
   lv_obj_set_tile_id(s_tv, 0, 0, LV_ANIM_OFF);
 }
 
-void openApp(App a) {
-  if (s_overlay) return;
+} // namespace ui
+
+static void buildOverlay(ui::App a) {
+  using namespace ui;
   lv_obj_t* scr = lv_screen_active();
 
   s_overlay = lv_obj_create(scr);
@@ -166,11 +202,42 @@ void openApp(App a) {
   }
 }
 
-void closeApp() {
+static void teardownOverlay() {
   if (!s_overlay) return;
   lv_obj_delete(s_overlay);
   s_overlay = nullptr;
-  s_active = APP_NONE;
+  s_active = ui::APP_NONE;
+}
+
+namespace ui {
+
+void openApp(App a) {
+  // When called while an overlay is already up (e.g. tapping a folder
+  // entry), treat it as a navigation push: remember the current app on the
+  // back-stack and rebuild for the new one on the next LVGL tick.
+  if (s_overlay) {
+    scheduleSwitch(a, /*push=*/true);
+    return;
+  }
+  buildOverlay(a);
+}
+
+void goBack() {
+  if (s_stackTop == 0) {
+    closeApp();
+    return;
+  }
+  App prev = s_stack[--s_stackTop];
+  if (s_overlay) {
+    scheduleSwitch(prev, /*push=*/false);
+  } else {
+    buildOverlay(prev);
+  }
+}
+
+void closeApp() {
+  s_stackTop = 0;
+  teardownOverlay();
 }
 
 void tick() {

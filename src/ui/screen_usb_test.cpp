@@ -36,8 +36,13 @@ static void scan() {
     return;
   }
   if (!sdcard::mounted()) {
-    lv_label_set_text(s_status, "No SD card mounted.");
-    if (s_action) lv_obj_add_flag(s_action, LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text(s_status,
+      "No SD card mounted.\n\n"
+      "Insert a card and tap TRY MOUNT.");
+    if (s_action) {
+      lv_obj_clear_flag(s_action, LV_OBJ_FLAG_HIDDEN);
+      lv_label_set_text(s_action_label, "TRY MOUNT");
+    }
     return;
   }
   File f = SD_MMC.open(FW_PATH, FILE_READ);
@@ -67,6 +72,13 @@ static void scan() {
 }
 
 static void cb_action(lv_event_t*) {
+  if (!sdcard::mounted()) {
+    lv_label_set_text(s_status, "Mounting...");
+    lv_refr_now(nullptr);
+    sdcard::init();
+    scan();
+    return;
+  }
   if (!s_have_file) { scan(); return; }
 
   lv_label_set_text(s_status, "Flashing... do not power off.");

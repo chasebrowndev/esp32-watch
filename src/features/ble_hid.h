@@ -21,7 +21,7 @@ namespace ble_hid {
   // Strings are owned by ble_hid (single internal buffer); copy before next call.
   const char* localAddr();             // this watch's own BD address
   const char* peerAddr();              // currently connected peer ("" if none)
-  bool        peerBlacklisted();       // true if a connected peer is being kicked
+  bool        peerBlacklisted();       // legacy; always false in single-select model
   uint8_t     numBonds();
   const char* bondAddr(uint8_t i);     // "" on out-of-range
   const char* bondName(uint8_t i);     // user-assigned label, "" if unset
@@ -29,17 +29,23 @@ namespace ble_hid {
   void        forget(uint8_t i);
   void        forgetAll();
 
-  // Bond gating (blacklist model): bonds default to "checked" = allowed to
-  // connect. Toggling a bond off blacklists it — any incoming connection
-  // matching its identity address is dropped by the tick() watchdog. PAIR
-  // NEW blacklists every existing bond so a fresh device can pair without
-  // an old phone racing in first. State persists in NVS.
-  bool        isSelected(uint8_t i);          // true = checked / allowed
-  void        selectBond(uint8_t i);          // check (un-blacklist) bond[i]
-  void        deselectBond(uint8_t i);        // uncheck (blacklist) bond[i]
-  void        clearSelection();               // PAIR NEW: blacklist ALL bonds
-  bool        pairNewMode();                  // true when every bond is blacklisted
-  void        exitPairNewMode();              // un-blacklist all bonds
+  // Single-selected-host model: at most ONE bond is "selected" at a time.
+  // Selecting a bond starts DIRECTED advertising at that peer's identity
+  // address with a timeout — the watch is asking that host to reconnect via
+  // the stored bond. Other bonds are not touched. PAIR NEW switches to
+  // undirected, discoverable advertising so a brand-new host can pair; it
+  // also clears the selection. State persists in NVS across reboots.
+  bool        isSelected(uint8_t i);          // true if bond[i] is the current target
+  void        selectBond(uint8_t i);          // start directed adv at bond[i]
+  void        deselectBond(uint8_t i);        // stop trying bond[i] (no kick)
+  void        clearSelection();               // PAIR NEW: undirected adv, accept any peer
+  bool        pairNewMode();                  // true while in PAIR NEW
+  void        exitPairNewMode();              // leave PAIR NEW, go idle
+
+  // Reconnect status for the UI.
+  bool        reconnecting();                 // directed adv running for selected host
+  bool        reconnectFailed();              // last directed adv timed out
+  void        retrySelection();               // re-arm directed adv on current selection
 
   // Media + nav actions (press+release one report).
   void playPause();
